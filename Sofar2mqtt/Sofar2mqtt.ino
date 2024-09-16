@@ -1,8 +1,7 @@
-
 // The device name is used as the MQTT base topic. If you need more than one Sofar2mqtt on your network, give them unique names.
-const char* version = "v3.2";
+const char* version = "v3.8";
 
-bool tftModel = true; //true means 2.8" color tft, false for oled version
+bool tftModel = true; //true means 2.8" color tft, false for oled version. This is always true for ESP32 devices as we don't use oled device for esp32.
 
 bool calculated = true; //default to pre-calculated values before sending to mqtt
 
@@ -10,104 +9,17 @@ unsigned int screenDimTimer = 30; //dim screen after 30 secs
 unsigned long lastScreenTouch = 0;
 
 
-#include <DoubleResetDetect.h>
-#define DRD_TIMEOUT 0.1
+#define ESP_DRD_USE_EEPROM true
+#include <ESP_DoubleResetDetector.h>
+#define DRD_TIMEOUT 5
 #define DRD_ADDRESS 0x00
-DoubleResetDetect drd(DRD_TIMEOUT, DRD_ADDRESS);
-
-
-#include <WiFiManager.h>
-#include <EEPROM.h>
-#define WIFI_TIMEOUT 300
-
-// * To be filled with EEPROM data
-char deviceName[64] = "Sofar";
-char MQTT_HOST[64] = "";
-char MQTT_PORT[6]  = "1883";
-char MQTT_USER[32] = "";
-char MQTT_PASS[32] = "";
-#define MQTTRECONNECTTIMER 30000 //it takes 30 secs for each mqtt server reconnect attempt
-unsigned long lastMqttReconnectAttempt = 0;
+DoubleResetDetector* drd;
 
 
 
-/*****
-  Sofar2mqtt is a remote control interface for Sofar solar and battery inverters.
-  It allows remote control of the inverter and reports the invertor status, power usage, battery state etc for integration with smart home systems such as Home Assistant and Node-Red vi MQTT.
-  For read only mode, it will send status messages without the inverter needing to be in passive mode.
-  It's designed to run on an ESP8266 microcontroller with a TTL to RS485 module such as MAX485 or MAX3485.
-  Designed to work with TTL modules with or without the DR and RE flow control pins. If your TTL module does not have these pins then just ignore the wire from D5.
-
-  Subscribe your MQTT client to:
-
-  Sofar2mqtt/state
-
-  Which provides:
-
-  running_state
-  grid_voltage
-  grid_current
-  grid_freq
-  systemIO_power (AC side of inverter)
-  battery_power  (DC side of inverter)
-  battery_voltage
-  battery_current
-  batterySOC
-  battery_temp
-  battery_cycles
-  grid_power
-  consumption
-  solarPV
-  today_generation
-  today_exported
-  today_purchase
-  today_consumption
-  inverter_temp
-  inverterHS_temp
-  solarPVAmps
-
-  With the inverter in Passive Mode, send MQTT messages to:
-
-  Sofar2mqtt/set/standby   - send value "true"
-  Sofar2mqtt/set/auto   - send value "true" or "battery_save"
-  Sofar2mqtt/set/charge   - send values in the range 0-3000 (watts)
-  Sofar2mqtt/set/discharge   - send values in the range 0-3000 (watts)
-
-  Each of the above will return a response on:
-  Sofar2mqtt/response/<function>, the message containing the response from
-  the inverter, which has a result code in the lower byte and status in the upper byte.
-
-  The result code will be 0 for success, 1 means "Invalid Work Mode" ( which possibly means
-  the inverter isn't in passive mode, ) and 3 means "Inverter busy." 2 and 4 are data errors
-  which shouldn't happen unless there's a cable issue or some such.
-
-  The status bits in the upper byte indicate the following:
-  Bit 0 - Charge enabled
-  Bit 1 - Discharge enabled
-  Bit 2 - Battery full, charge prohibited
-  Bit 3 - Battery flat, discharge prohibited
-
-  For example, a publish to Sofar2mqtt/set/charge will result in one on Sofar2mqtt/response/charge.
-  AND the message with 0xff to get the result code, which should be 0.
-
-  battery_save is a hybrid auto mode that will charge from excess solar but not discharge.
-
-  There will also be messages published to Sofar2mqtt/response/<type> when things happen
-  in the background, such as setting auto mode on startup and switching modes in battery_save mode.
-
-  (c)Colin McGerty 2021 colin@mcgerty.co.uk
-  Major version 2.0 rewrite by Adam Hill sidepipeukatgmaildotcom
-  Thanks to Rich Platts for hybrid model code and testing.
-  calcCRC by angelo.compagnucci@gmail.com and jpmzometa@gmail.com
-*****/
-#include <Arduino.h>
-
-#define SOFAR_SLAVE_ID          0x01
-
-#define MAX_POWER		3000 //maybe change in further models
-
-#define RS485_TRIES 8       // x 50mS to wait for RS485 input chars.
+#if defined(ESP8266)
 // Wifi parameters.
+#include <WiFiManager.h>
 #include <ESP8266WiFi.h>
 WiFiClient wifi;
 
@@ -116,6 +28,41 @@ WiFiClient wifi;
 #include <ESP8266HTTPUpdateServer.h>
 ESP8266WebServer httpServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
+
+#elif defined(ESP32)
+#include <WiFiManager.h>
+// Wifi parameters.
+#include <WiFi.h>
+WiFiClient wifi;
+
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <HTTPUpdateServer.h>
+
+WebServer httpServer(80);
+HTTPUpdateServer httpUpdater;
+#endif
+
+#include <EEPROM.h>
+#define PORTAL_TIMEOUT 300 //reboots device if hotspot isn't configured after this time
+#define WIFI_TIMEOUT 60 //try this long to connect to existing wifi before going to hotspot portal mode
+
+// * To be filled with EEPROM data
+char deviceName[65] = "Sofar";
+char MQTT_HOST[65] = "";
+char MQTT_PORT[6]  = "1883";
+char MQTT_USER[65] = "";
+char MQTT_PASS[65] = "";
+#define MQTTRECONNECTTIMER 30000 //it takes 30 secs for each mqtt server reconnect attempt
+unsigned long lastMqttReconnectAttempt = 0;
+
+#include <Arduino.h>
+
+#define SOFAR_SLAVE_ID          0x01
+
+#define MAX_POWER		3000 //only used in peakshaving now
+
+#define RS485_TRIES 40       // x 10mS to wait for RS485 input chars.
 
 char jsonstring[1000];
 
@@ -127,11 +74,11 @@ PubSubClient mqtt(wifi);
 // The built-in serial port remains available for flashing and debugging.
 #include <SoftwareSerial.h>
 //for OLED version default to original sofar2mqtt ports
-#define SERIAL_COMMUNICATION_CONTROL_PIN D5 // Transmission set pin OLED version
+#define SERIAL_COMMUNICATION_CONTROL_PIN 14 // Transmission set pin OLED version
 #define RS485_TX HIGH
 #define RS485_RX LOW
-#define OLEDRXPin    D6  // Serial Receive pin OLED version
-#define OLEDTXPin    D7  // Serial Transmit pin OLED version
+#define OLEDRXPin    12  // Serial Receive pin OLED version
+#define OLEDTXPin    13  // Serial Transmit pin OLED version
 SoftwareSerial RS485Serial(OLEDRXPin, OLEDTXPin);
 
 //for TFT verion we use the hardware serial (pin 3 and 1)
@@ -142,16 +89,43 @@ SoftwareSerial RS485Serial(OLEDRXPin, OLEDTXPin);
 
 unsigned int INVERTER_RUNNINGSTATE;
 
-#define MAX_FRAME_SIZE          64
-#define MODBUS_FN_READSINGLEREG 0x03
+#define MAX_FRAME_SIZE          224
+#define MODBUS_FN_READHOLDINGREG 0x03
+#define MODBUS_FN_READINPUTREG 0x04
 #define MODBUS_FN_WRITEMULREG 0x10
 #define SOFAR_FN_PASSIVEMODE    0x42
 #define SOFAR_PARAM_STANDBY     0x5555
 
 // Battery Save mode is a hybrid mode where the battery will charge from excess solar but not discharge.
 bool BATTERYSAVE = false;
+// Peakshaving will allow the inverter to charge or discharge the battery depending on a limited export or import power value, everything above will be go to or from battery
+bool PEAKSHAVING = false;
+// Selfusemode will allow the inverter to charge or discharge the battery depending on self usage (just like auto mode)
+bool SELFUSEMODE = false;
+
+//for HYDV2 there is possiblity for more than 1 battery connection, for now we only check for 2nd battery. Need to adapt later. This boolean is to show if this 2nd battery is detected (if there is battery voltage)
+bool battery2Installed = false;
+
+
+// This is the return object for the sendModbus() function. Since we are a modbus master, we
+// are primarily interested in the responses to our commands.
+struct modbusResponse
+{
+  uint8_t errorLevel;
+  uint8_t data[MAX_FRAME_SIZE];
+  uint8_t dataSize;
+  uint8_t frame[MAX_FRAME_SIZE];
+  uint8_t frameSize;  
+  char* errorMessage;
+};
+
+bool modbusError = true;
 
 // SoFar Information Registers
+#define ME3000_START 0x0200
+#define ME3000_END 0x0239
+#define HYBRID_START 0x0200
+#define HYBRID_END 0x0255
 #define SOFAR_REG_RUNSTATE	0x0200
 #define SOFAR_REG_GRIDV		0x0206
 #define SOFAR_REG_GRIDA		0x0207
@@ -169,160 +143,235 @@ bool BATTERYSAVE = false;
 #define SOFAR_REG_EXPDAY	0x0219
 #define SOFAR_REG_IMPDAY	0x021a
 #define SOFAR_REG_LOADDAY	0x021b
+#define SOFAR_REG_PVTOTAL   0x021c
+#define SOFAR_REG_EXPTOTAL  0x021e
+#define SOFAR_REG_IMPTOTAL  0x0220
+#define SOFAR_REG_LOADTOTAL 0x0222
 #define SOFAR_REG_CHARGDAY  0x0224
 #define SOFAR_REG_DISCHDAY  0x0225
+#define SOFAR_REG_CHARGTOTAL  0x0226
+#define SOFAR_REG_DISCHTOTAL  0x0228
 #define SOFAR_REG_BATTCYC	0x022c
 #define SOFAR_REG_PVA		0x0236
+#define SOFAR_REG_BATTSOH 0x0237
 #define SOFAR_REG_INTTEMP	0x0238
 #define SOFAR_REG_HSTEMP	0x0239
 #define SOFAR_REG_PV1		0x0252
 #define SOFAR_REG_PV2		0x0255
+#define SOFAR_WORKING_MODE 0x1200
+#define SOFAR_ANTIREFLUX_CONTROL 0x1242
+#define SOFAR_ANTIREFLUX_POWER 0x1243
 
 #define SOFAR_FN_STANDBY	0x0100
 #define SOFAR_FN_DISCHARGE	0x0101
 #define SOFAR_FN_CHARGE		0x0102
 #define SOFAR_FN_AUTO		0x0103
 
-#define SOFAR2_REG_RUNSTATE  0x0404
-#define SOFAR2_REG_GRIDV   0x048D
-#define SOFAR2_REG_GRIDFREQ  0x0484
-#define SOFAR2_REG_BATTW   0x0606
-#define SOFAR2_REG_BATTV   0x0604
-#define SOFAR2_REG_BATTA   0x0605
-#define SOFAR2_REG_BATTSOC 0x0608
-#define SOFAR2_REG_BATTTEMP  0x0607
-#define SOFAR2_REG_ACTW   0x0485
-#define SOFAR2_REG_EXPW  0x0488
-#define SOFAR2_REG_EXTW   0x04AE
-#define SOFAR2_REG_LOADW   0x04AF
-#define SOFAR2_REG_PVW   0x05C4
-#define SOFAR2_REG_PVDAY   0x0685
-#define SOFAR2_REG_EXPDAY  0x0691
-#define SOFAR2_REG_IMPDAY  0x068D
-#define SOFAR2_REG_LOADDAY 0x0689
-#define SOFAR2_REG_CHARGDAY  0x0695
-#define SOFAR2_REG_DISCHDAY  0x0699
-#define SOFAR2_REG_BATTCYC 0x060A
+//for HYD-EP and HYD-KTL
+//system (0x0400-0x047F)
+#define SOFAR2_SYSTEM_BEGIN 0x0404
+#define SOFAR2_SYSTEM_END 0x041A
+#define SOFAR2_REG_RUNSTATE 0x0404
 #define SOFAR2_REG_INTTEMP 0x0418
 #define SOFAR2_REG_HSTEMP  0x041A
+//on grid output (0x0480-0x04FF)
+#define SOFAR2_GRID_BEGIN 0x0484
+#define SOFAR2_GRID_END 0x04AF
+#define SOFAR2_REG_GRIDFREQ  0x0484
+#define SOFAR2_REG_ACTW   0x0485
+#define SOFAR2_REG_EXPW  0x0488
+#define SOFAR2_REG_GRIDV   0x048D
+#define SOFAR2_REG_LOADW   0x04AF
+//PV INPUT (0x0580-0x05FF)
+#define SOFAR2_PV_BEGIN 0x0584
+#define SOFAR2_PV_END 0x0589
 #define SOFAR2_REG_VPV1   0x0584
 #define SOFAR2_REG_APV1   0x0585
 #define SOFAR2_REG_PV1   0x0586
 #define SOFAR2_REG_VPV2   0x0587
 #define SOFAR2_REG_APV2   0x0588
 #define SOFAR2_REG_PV2   0x0589
+//seperate
+#define SOFAR2_REG_PVW   0x05C4
+//Battery input (0x0600-0x067F)
+#define SOFAR2_BAT_BEGIN 0x0604
+#define SOFAR2_BAT_END 0x0611
+#define SOFAR2_REG_BATTV   0x0604
+#define SOFAR2_REG_BATTA   0x0605
+#define SOFAR2_REG_BATTW   0x0606
+#define SOFAR2_REG_BATTTEMP  0x0607
+#define SOFAR2_REG_BATTSOC 0x0608
+#define SOFAR2_REG_BATTSOH 0x0609
+#define SOFAR2_REG_BATTCYC 0x060A
+#define SOFAR2_REG_BATT2V   0x060B
+#define SOFAR2_REG_BATT2A   0x060C
+#define SOFAR2_REG_BATT2W   0x060D
+#define SOFAR2_REG_BATT2TEMP  0x060E
+#define SOFAR2_REG_BATT2SOC 0x060F
+#define SOFAR2_REG_BATT2SOH 0x0610
+#define SOFAR2_REG_BATT2CYC 0x0611
+#define SOFAR2_REG_BATTTOTALW 0x0667
+#define SOFAR2_REG_BATTAVGSOC 0x0668
+#define SOFAR2_REG_BATTAVGSOH 0x0669
+//Electric  Power (0x0680-0x06BF)
+#define SOFAR2_POW_BEGIN 0x0684
+#define SOFAR2_POW_END 0x069B //one more because of 32bit value stored
+#define SOFAR2_REG_PVDAY   0x0684
+#define SOFAR2_REG_PVTOTAL   0x0686
+#define SOFAR2_REG_LOADDAY 0x0688
+#define SOFAR2_REG_LOADTOTAL 0x068A
+#define SOFAR2_REG_IMPDAY  0x068C
+#define SOFAR2_REG_IMPTOTAL  0x068E
+#define SOFAR2_REG_EXPDAY  0x0690
+#define SOFAR2_REG_EXPTOTAL  0x0692
+#define SOFAR2_REG_CHARGDAY  0x0694
+#define SOFAR2_REG_CHARGTOTAL  0x0696
+#define SOFAR2_REG_DISCHDAY  0x0698
+#define SOFAR2_REG_DISCHTOTAL  0x069A
+//end
+#define SOFAR2_WORKING_MODE 0x1110
+#define SOFAR2_ANTIREFLUX_CONTROL 0x1023
+#define SOFAR2_ANTIREFLUX_POWER 0x1024
 
-#define SOFAR2_REG_STORAGEMODE  0x4368
-#define SOFAR2_REG_PASSIVECONTROL 0x1187 //in decimal 4487-4492, write 3x 32bit values with first 32bit = 0x0000 and next two are same (actually low=high limit) for the value of passive control
+#define SOFAR2_REG_PASSIVECONTROL 0x1187 //in decimal 4487-4492, write 3x 32BIT values with first 32BIT = 0x0000 and next two are same (actually low=high limit) for the value of passive control
 
-enum calculatorT {NOCALC, DIV10, DIV100, MUL10, MUL100};
+enum calculatorT {NOCALC, DIV10, DIV100, MUL10, MUL100, COMBINE};
+enum valueTypeT {U16, S16, U32, S32, FLOAT};
 enum inverterModelT {ME3000, HYBRID, HYDV2};
 inverterModelT inverterModel = ME3000; //default to ME3000
+
+bool separateMqttTopics = false;
 
 struct mqtt_status_register
 {
   inverterModelT inverter;
   uint16_t regnum;
   String    mqtt_name;
+  valueTypeT valueType;
   calculatorT calculator;
 };
 
 static struct mqtt_status_register  mqtt_status_reads[] =
 {
-  { ME3000, SOFAR_REG_RUNSTATE, "running_state", NOCALC},
-  { ME3000, SOFAR_REG_GRIDV, "grid_voltage", DIV10},
-  { ME3000, SOFAR_REG_GRIDA, "grid_current", DIV100},
-  { ME3000, SOFAR_REG_GRIDFREQ, "grid_freq", DIV100 },
-  { ME3000, SOFAR_REG_GRIDW, "grid_power", MUL10 },
-  { ME3000, SOFAR_REG_BATTW, "battery_power", MUL10 },
-  { ME3000, SOFAR_REG_BATTV, "battery_voltage", DIV10 },
-  { ME3000, SOFAR_REG_BATTA, "battery_current", DIV100 },
-  { ME3000, SOFAR_REG_SYSIOW, "inverter_power", MUL10 },
-  { ME3000, SOFAR_REG_BATTSOC, "batterySOC", NOCALC },
-  { ME3000, SOFAR_REG_BATTTEMP, "battery_temp", NOCALC },
-  { ME3000, SOFAR_REG_BATTCYC, "battery_cycles", NOCALC },
-  { ME3000, SOFAR_REG_LOADW, "consumption", MUL10},
-  { ME3000, SOFAR_REG_PVW, "solarPV", MUL10 },
-  { ME3000, SOFAR_REG_PVA, "solarPVAmps", NOCALC },
-  { ME3000, SOFAR_REG_EXPDAY, "today_exported", DIV100 },
-  { ME3000, SOFAR_REG_IMPDAY, "today_purchase", DIV100 },
-  { ME3000, SOFAR_REG_PVDAY, "today_generation", DIV100 },
-  { ME3000, SOFAR_REG_LOADDAY, "today_consumption", DIV100 },
-  { ME3000, SOFAR_REG_CHARGDAY, "today_charged", DIV100 },
-  { ME3000, SOFAR_REG_DISCHDAY, "today_discharged", DIV100 },
-  { ME3000, SOFAR_REG_INTTEMP, "inverter_temp", NOCALC },
-  { ME3000, SOFAR_REG_HSTEMP, "inverter_HStemp", NOCALC },
-  { HYBRID, SOFAR_REG_RUNSTATE, "running_state", NOCALC },
-  { HYBRID, SOFAR_REG_GRIDV, "grid_voltage", DIV10 },
-  { HYBRID, SOFAR_REG_GRIDA, "grid_current", DIV100 },
-  { HYBRID, SOFAR_REG_GRIDFREQ, "grid_freq", DIV100 },
-  { HYBRID, SOFAR_REG_GRIDW, "grid_power", MUL10 },
-  { HYBRID, SOFAR_REG_BATTW, "battery_power", MUL10 },
-  { HYBRID, SOFAR_REG_BATTV, "battery_voltage", DIV10 },
-  { HYBRID, SOFAR_REG_BATTA, "battery_current", DIV100 },
-  { HYBRID, SOFAR_REG_SYSIOW, "inverter_power", MUL10 },
-  { HYBRID, SOFAR_REG_BATTSOC, "batterySOC", NOCALC },
-  { HYBRID, SOFAR_REG_BATTTEMP, "battery_temp", NOCALC },
-  { HYBRID, SOFAR_REG_BATTCYC, "battery_cycles", NOCALC },
-  { HYBRID, SOFAR_REG_LOADW, "consumption", MUL10 },
-  { HYBRID, SOFAR_REG_PVW, "solarPV", MUL10 },
-  { HYBRID, SOFAR_REG_PVA, "solarPVAmps", NOCALC },
-  { HYBRID, SOFAR_REG_PV1, "solarPV1", MUL10 },
-  { HYBRID, SOFAR_REG_PV2, "solarPV2", MUL10 },
-  { HYBRID, SOFAR_REG_PVDAY, "today_generation", DIV100 },
-  { HYBRID, SOFAR_REG_LOADDAY, "today_consumption", DIV100 },
-  { HYBRID, SOFAR_REG_EXPDAY, "today_exported", DIV100 },
-  { HYBRID, SOFAR_REG_IMPDAY, "today_purchase", DIV100 },
-  { HYBRID, SOFAR_REG_CHARGDAY, "today_charged", DIV100 },
-  { HYBRID, SOFAR_REG_DISCHDAY, "today_discharged", DIV100 },
-  { HYBRID, SOFAR_REG_INTTEMP, "inverter_temp", NOCALC },
-  { HYBRID, SOFAR_REG_HSTEMP, "inverter_HStemp", NOCALC },
-  { HYDV2, SOFAR2_REG_RUNSTATE, "running_state", NOCALC },
-  { HYDV2, SOFAR2_REG_GRIDV, "grid_voltage", DIV10 },
-  { HYDV2, SOFAR2_REG_GRIDFREQ, "grid_freq", DIV100 },
-  { HYDV2, SOFAR2_REG_BATTW, "battery_power", MUL10 },
-  { HYDV2, SOFAR2_REG_BATTV, "battery_voltage", DIV10 },
-  { HYDV2, SOFAR2_REG_BATTA, "battery_current", DIV100 },
-  { HYDV2, SOFAR2_REG_BATTSOC, "batterySOC", NOCALC },
-  { HYDV2, SOFAR2_REG_BATTTEMP, "battery_temp", NOCALC },
-  { HYDV2, SOFAR2_REG_ACTW, "inverter_power", MUL10 },
-  { HYDV2, SOFAR2_REG_EXPW, "grid_power", MUL10},
-  { HYDV2, SOFAR2_REG_LOADW, "consumption", MUL10 },
-  { HYDV2, SOFAR2_REG_PVW, "solarPV", MUL100 },
-  { HYDV2, SOFAR2_REG_PVDAY, "today_generation", DIV100 },
-  { HYDV2, SOFAR2_REG_EXPDAY, "today_exported", DIV100 },
-  { HYDV2, SOFAR2_REG_IMPDAY, "today_purchase", DIV100 },
-  { HYDV2, SOFAR2_REG_LOADDAY, "today_consumption", DIV100 },
-  { HYDV2, SOFAR2_REG_CHARGDAY, "today_charged", DIV100 },
-  { HYDV2, SOFAR2_REG_DISCHDAY, "today_discharged", DIV100 },
-  { HYDV2, SOFAR2_REG_BATTCYC, "battery_cycles", NOCALC },
-  { HYDV2, SOFAR2_REG_INTTEMP, "inverter_temp", NOCALC },
-  { HYDV2, SOFAR2_REG_HSTEMP, "inverter_HStemp", NOCALC},
-  { HYDV2, SOFAR2_REG_PV1, "solarPV1", MUL10},
-  { HYDV2, SOFAR2_REG_VPV1, "solarPV1Volt", DIV10},
-  { HYDV2, SOFAR2_REG_APV1, "solarPV1Current", DIV100},
-  { HYDV2, SOFAR2_REG_PV2, "solarPV2", MUL10},
-  { HYDV2, SOFAR2_REG_VPV2, "solarPV2Volt", DIV10},
-  { HYDV2, SOFAR2_REG_APV2, "solarPV2Current", DIV100},
+  { ME3000, SOFAR_REG_RUNSTATE, "running_state", U16, NOCALC},
+  { ME3000, SOFAR_REG_GRIDV, "grid_voltage", U16, DIV10},
+  { ME3000, SOFAR_REG_GRIDA, "grid_current", S16, DIV100},
+  { ME3000, SOFAR_REG_GRIDFREQ, "grid_freq", U16, DIV100 },
+  { ME3000, SOFAR_REG_GRIDW, "grid_power", S16, MUL10 },
+  { ME3000, SOFAR_REG_BATTW, "battery_power", S16, MUL10 },
+  { ME3000, SOFAR_REG_BATTV, "battery_voltage", U16, DIV10 },
+  { ME3000, SOFAR_REG_BATTA, "battery_current", S16, DIV100 },
+  { ME3000, SOFAR_REG_SYSIOW, "inverter_power", S16, MUL10 },
+  { ME3000, SOFAR_REG_BATTSOC, "batterySOC", U16, NOCALC },
+  { ME3000, SOFAR_REG_BATTSOH, "batterySOH", U16, NOCALC },
+  { ME3000, SOFAR_REG_BATTTEMP, "battery_temp", S16, NOCALC },
+  { ME3000, SOFAR_REG_BATTCYC, "battery_cycles", U16, NOCALC },
+  { ME3000, SOFAR_REG_LOADW, "consumption", S16, MUL10},
+  { ME3000, SOFAR_REG_PVW, "solarPV", U16, MUL10 },
+  { ME3000, SOFAR_REG_PVA, "solarPVAmps", U16, NOCALC },
+  { ME3000, SOFAR_REG_EXPDAY, "today_exported", U16, DIV100 },
+  { ME3000, SOFAR_REG_IMPDAY, "today_purchase", U16, DIV100 },
+  { ME3000, SOFAR_REG_PVDAY, "today_generation", U16, DIV100 },
+  { ME3000, SOFAR_REG_LOADDAY, "today_consumption", U16, DIV100 },
+  { ME3000, SOFAR_REG_EXPTOTAL, "total_exported", U32, COMBINE },
+  { ME3000, SOFAR_REG_IMPTOTAL, "total_purchase", U32, COMBINE },
+  { ME3000, SOFAR_REG_PVTOTAL, "total_generation", U32, COMBINE },
+  { ME3000, SOFAR_REG_LOADTOTAL, "total_consumption", U32, COMBINE },
+  { ME3000, SOFAR_REG_CHARGDAY, "today_charged", U16, DIV100 },
+  { ME3000, SOFAR_REG_DISCHDAY, "today_discharged", U16, DIV100 },
+  { ME3000, SOFAR_REG_CHARGTOTAL, "total_charged", U32, COMBINE },
+  { ME3000, SOFAR_REG_DISCHTOTAL, "total_discharged", U32, COMBINE },
+  { ME3000, SOFAR_REG_INTTEMP, "inverter_temp", S16, NOCALC },
+  { ME3000, SOFAR_REG_HSTEMP, "inverter_HStemp", S16, NOCALC },
+  { ME3000, SOFAR_WORKING_MODE, "working_mode", U16, NOCALC},
+  { HYBRID, SOFAR_REG_RUNSTATE, "running_state", U16, NOCALC },
+  { HYBRID, SOFAR_REG_GRIDV, "grid_voltage", U16, DIV10 },
+  { HYBRID, SOFAR_REG_GRIDA, "grid_current", S16, DIV100 },
+  { HYBRID, SOFAR_REG_GRIDFREQ, "grid_freq", U16, DIV100 },
+  { HYBRID, SOFAR_REG_GRIDW, "grid_power", S16, MUL10 },
+  { HYBRID, SOFAR_REG_BATTW, "battery_power", S16, MUL10 },
+  { HYBRID, SOFAR_REG_BATTV, "battery_voltage", U16, DIV10 },
+  { HYBRID, SOFAR_REG_BATTA, "battery_current", S16, DIV100 },
+  { HYBRID, SOFAR_REG_SYSIOW, "inverter_power", S16, MUL10 },
+  { HYBRID, SOFAR_REG_BATTSOC, "batterySOC", U16, NOCALC },
+  { HYBRID, SOFAR_REG_BATTSOH, "batterySOH", U16, NOCALC },
+  { HYBRID, SOFAR_REG_BATTTEMP, "battery_temp", S16, NOCALC },
+  { HYBRID, SOFAR_REG_BATTCYC, "battery_cycles", U16, NOCALC },
+  { HYBRID, SOFAR_REG_LOADW, "consumption", S16, MUL10 },
+  { HYBRID, SOFAR_REG_PVW, "solarPV", U16, MUL10 },
+  { HYBRID, SOFAR_REG_PVA, "solarPVAmps", U16, NOCALC },
+  { HYBRID, SOFAR_REG_PV1, "solarPV1", U16, MUL10 },
+  { HYBRID, SOFAR_REG_PV2, "solarPV2", U16, MUL10 },
+  { HYBRID, SOFAR_REG_PVDAY, "today_generation", U16, DIV100 },
+  { HYBRID, SOFAR_REG_LOADDAY, "today_consumption", U16, DIV100 },
+  { HYBRID, SOFAR_REG_EXPDAY, "today_exported", U16, DIV100 },
+  { HYBRID, SOFAR_REG_IMPDAY, "today_purchase", U16, DIV100 },
+  { HYBRID, SOFAR_REG_CHARGDAY, "today_charged", U16, DIV100 },
+  { HYBRID, SOFAR_REG_DISCHDAY, "today_discharged", U16, DIV100 },
+  { HYBRID, SOFAR_REG_PVTOTAL, "total_generation", U32, COMBINE },
+  { HYBRID, SOFAR_REG_LOADTOTAL, "total_consumption", U32, COMBINE },
+  { HYBRID, SOFAR_REG_EXPTOTAL, "total_exported", U32, COMBINE },
+  { HYBRID, SOFAR_REG_IMPTOTAL, "total_purchase", U32, COMBINE },
+  { HYBRID, SOFAR_REG_CHARGTOTAL, "total_charged", U32, COMBINE },
+  { HYBRID, SOFAR_REG_DISCHTOTAL, "total_discharged", U32, COMBINE },
+  { HYBRID, SOFAR_REG_INTTEMP, "inverter_temp", S16, NOCALC },
+  { HYBRID, SOFAR_REG_HSTEMP, "inverter_HStemp", S16, NOCALC },
+  { HYBRID, SOFAR_WORKING_MODE, "working_mode", U16, NOCALC},
+  { HYDV2, SOFAR2_REG_RUNSTATE, "running_state", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_INTTEMP, "inverter_temp", S16, NOCALC },
+  { HYDV2, SOFAR2_REG_HSTEMP, "inverter_HStemp", S16, NOCALC},
+  { HYDV2, SOFAR2_REG_GRIDFREQ, "grid_freq", U16, DIV100 },
+  { HYDV2, SOFAR2_REG_ACTW, "inverter_power", S16, MUL10 },
+  { HYDV2, SOFAR2_REG_EXPW, "grid_power", S16, MUL10},
+  { HYDV2, SOFAR2_REG_GRIDV, "grid_voltage", U16, DIV10 },
+  { HYDV2, SOFAR2_REG_LOADW, "consumption", S16, MUL10 },
+  { HYDV2, SOFAR2_REG_VPV1, "solarPV1Volt", U16, DIV10},
+  { HYDV2, SOFAR2_REG_APV1, "solarPV1Current", U16, DIV100},
+  { HYDV2, SOFAR2_REG_PV1, "solarPV1", U16, MUL10},
+  { HYDV2, SOFAR2_REG_VPV2, "solarPV2Volt", U16, DIV10},
+  { HYDV2, SOFAR2_REG_APV2, "solarPV2Current", U16, DIV100},
+  { HYDV2, SOFAR2_REG_PV2, "solarPV2", U16, MUL10},
+  { HYDV2, SOFAR2_REG_PVW, "solarPV", U16, MUL100 },
+  { HYDV2, SOFAR2_REG_BATTV, "battery_voltage", U16, DIV10 },
+  { HYDV2, SOFAR2_REG_BATTA, "battery_current", S16, DIV100 },
+  { HYDV2, SOFAR2_REG_BATTW, "battery_power", S16, MUL10 },
+  { HYDV2, SOFAR2_REG_BATTTEMP, "battery_temp", S16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATTSOC, "batterySOC", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATTSOH, "batterySOH", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATTCYC, "battery_cycles", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATT2V, "battery2_voltage", U16, DIV10 },
+  { HYDV2, SOFAR2_REG_BATT2A, "battery2_current", S16, DIV100 },
+  { HYDV2, SOFAR2_REG_BATT2W, "battery2_power", S16, MUL10 },
+  { HYDV2, SOFAR2_REG_BATT2TEMP, "battery2_temp", S16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATT2SOC, "battery2SOC", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATT2SOH, "battery2SOH", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATT2CYC, "battery2_cycles", U16, NOCALC },
+  { HYDV2, SOFAR2_REG_BATTTOTALW, "battery_total_power", S16, MUL100 },  
+  { HYDV2, SOFAR2_REG_BATTAVGSOC, "battery_avg_SOC", U16, NOCALC }, 
+  { HYDV2, SOFAR2_REG_BATTAVGSOH, "battery_avg_SOH", U16, NOCALC }, 
+  { HYDV2, SOFAR2_REG_PVDAY, "today_generation", U32, DIV100 },
+  { HYDV2, SOFAR2_REG_PVTOTAL, "total_generation", U32, DIV10 },
+  { HYDV2, SOFAR2_REG_LOADDAY, "today_consumption", U32, DIV100 },
+  { HYDV2, SOFAR2_REG_LOADTOTAL, "total_consumption", U32, DIV10 },
+  { HYDV2, SOFAR2_REG_IMPDAY, "today_purchase", U32, DIV100 },
+  { HYDV2, SOFAR2_REG_IMPTOTAL, "total_purchase", U32, DIV10 },
+  { HYDV2, SOFAR2_REG_EXPDAY, "today_exported", U32, DIV100 },
+  { HYDV2, SOFAR2_REG_EXPTOTAL, "total_exported", U32, DIV10 },
+  { HYDV2, SOFAR2_REG_CHARGDAY, "today_charged", U32, DIV100 },
+  { HYDV2, SOFAR2_REG_CHARGTOTAL, "total_charged", U32, DIV10 },
+  { HYDV2, SOFAR2_REG_DISCHDAY, "today_discharged", U32, DIV100 },
+  { HYDV2, SOFAR2_REG_DISCHTOTAL, "total_discharged", U32, DIV10 },
+  { HYDV2, SOFAR2_WORKING_MODE, "working_mode", U16, NOCALC},
 };
 
-// This is the return object for the sendModbus() function. Since we are a modbus master, we
-// are primarily interested in the responses to our commands.
-struct modbusResponse
-{
-  uint8_t errorLevel;
-  uint8_t data[MAX_FRAME_SIZE];
-  uint8_t dataSize;
-  char* errorMessage;
-};
-
-bool modbusError = true;
 
 // These timers are used in the main loop.
 #define HEARTBEAT_INTERVAL 9000
 #define RUNSTATE_INTERVAL 5000
 #define SEND_INTERVAL 10000
 #define BATTERYSAVE_INTERVAL 3000
+#define PEAKSHAVING_INTERVAL 3000
+#define SELFUSE_INTERVAL 3000
 
 // Wemos OLED Shield set up. 64x48, pins D1 and D2
 #include <SPI.h>
@@ -332,16 +381,38 @@ bool modbusError = true;
 
 //for the tft
 #include <Adafruit_ILI9341.h>   // include Adafruit ILI9341 TFT library
-#define TFT_CS    D1     // TFT CS  pin is connected to arduino pin 8
-#define TFT_DC    D2     // TFT DC  pin is connected to arduino pin 10
+#if defined(ESP8266)
+#define TFT_CS    D1
+#define TFT_DC    D2
 #define TFT_LED   D8
+#define TFT_MOSI 13
+#define TFT_MISO 12
+#define TFT_SCLK 14
 // initialize ILI9341 TFT library
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
+#elif defined(ESP32)
+//make sure to change pins_arduino.h for your board to match MISO, MOSI, SCLK and CS for hardware SPI
+#define TFT_CS    1
+#define TFT_DC    4
+#define TFT_LED   5
+#define TFT_MOSI 7
+#define TFT_MISO 2
+#define TFT_SCLK 6
+#define TFT_RST 10
+// initialize ILI9341 TFT library
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+#endif
+
 
 //for touch
 #include <XPT2046_Touchscreen.h>
+#if defined(ESP8266)
 #define TCS_PIN  0
 #define TIRQ_PIN  2
+#elif defined(ESP32)
+#define TCS_PIN  0
+#define TIRQ_PIN  3
+#endif
 XPT2046_Touchscreen ts(TCS_PIN, TIRQ_PIN);
 
 //for the oled
@@ -495,8 +566,14 @@ void saveToEeprom() {
   EEPROM.write(200, tftModel); // * 200
   EEPROM.write(201, calculated); // * 201
   EEPROM.write(202, screenDimTimer); // * 202
+  EEPROM.write(203, separateMqttTopics); // * 203
   EEPROM.commit();
-  ESP.reset(); // reset after save to activate new settings
+  // reset after save to activate new settings
+#if defined(ESP8266)
+  ESP.reset();
+#elif defined(ESP32)
+  ESP.restart();
+#endif
 }
 
 bool loadFromEeprom() {
@@ -516,11 +593,12 @@ bool loadFromEeprom() {
     } else if (EEPROM.read(199) == 2) {
       inverterModel = HYDV2;
     }
-    tftModel = false;
-    if (EEPROM.read(200)) tftModel = true;
-    calculated = false;
-    if (EEPROM.read(201)) calculated = true;
+#if defined(ESP8266)
+    tftModel = EEPROM.read(200);
+#endif
+    calculated = EEPROM.read(201);
     screenDimTimer = EEPROM.read(202);
+    separateMqttTopics = EEPROM.read(203);
     WiFi.hostname(deviceName);
     return true;
   }
@@ -536,6 +614,7 @@ void setup_wifi()
   WiFiManagerParameter CUSTOM_MQTT_USER("user", "MQTT user",     MQTT_USER, 32);
   WiFiManagerParameter CUSTOM_MQTT_PASS("pass", "MQTT pass",     MQTT_PASS, 32);
 
+#if defined(ESP8266)
   const char *bufferStr = R"(
   <br/>
   <p>Select LCD screen type:</p>
@@ -615,10 +694,71 @@ void setup_wifi()
   document.getElementById('key_custom_mode').hidden = true;
   </script>
   )";
+#elif defined(ESP32)
+  const char *bufferStr = R"(
+  <br/>
+  <p>Select inverter type:</p>
+  <input style='display: inline-block;' type='radio' id='ME3000' name='inverter_selection' onclick='setHiddenValueInverter()'>
+  <label for='ME3000'>ME3000SP</label><br/>
+  <input style='display: inline-block;' type='radio' id='HYBRID' name='inverter_selection' onclick='setHiddenValueInverter()'>
+  <label for='HYBRID'>HYDxxxxES</label><br/>
+  <input style='display: inline-block;' type='radio' id='HYDV2' name='inverter_selection' onclick='setHiddenValueInverter()'>
+  <label for='HYDV2'>HYD EP/KTL</label><br/>  
+  <br/>
+  <p>Select data mode:</p>
+  <input style='display: inline-block;' type='radio' id='RAW' name='mode_selection' onclick='setHiddenValueMode()'>
+  <label for='RAW'>Raw data</label><br/>
+  <input style='display: inline-block;' type='radio' id='CALCULATED' name='mode_selection' onclick='setHiddenValueMode()'>
+  <label for='CALCULATED'>Calculated data</label><br/>
+  <br/>
+  <script>
+  function setHiddenValueInverter() {
+    var checkBoxME3000 = document.getElementById('ME3000');
+    var hiddenvalue = document.getElementById('key_custom_inverter');
+    if (checkBoxME3000.checked == true){
+      hiddenvalue.value=0
+    } else {
+      var checkBoxHYBRID = document.getElementById('HYBRID');
+       if (checkBoxME3000.checked == true){
+         hiddenvalue.value=1 
+       } else {
+         hiddenvalue.value=2 
+       }
+      
+    }
+  }
+  function setHiddenValueMode() {
+    var checkBox = document.getElementById('RAW');
+    var hiddenvalue = document.getElementById('key_custom_mode');
+    if (checkBox.checked == true){
+      hiddenvalue.value=0
+    } else {
+      hiddenvalue.value=1
+    }
+  }
+  if (document.getElementById("key_custom_inverter").value === "1") {
+    document.getElementById("HYBRID").checked = true  
+  } else {
+    document.getElementById("ME3000").checked = true  
+  }
+  document.querySelector("[for='key_custom_inverter']").hidden = true;
+  document.getElementById('key_custom_inverter').hidden = true;
+  if (document.getElementById("key_custom_mode").value === "1") {
+    document.getElementById("CALCULATED").checked = true  
+  } else {
+    document.getElementById("RAW").checked = true  
+  }
+  document.querySelector("[for='key_custom_mode']").hidden = true;
+  document.getElementById('key_custom_mode').hidden = true;
+  </script>
+  )";
+#endif
   WiFiManagerParameter custom_html_inputs(bufferStr);
+#if defined(ESP8266)  
   char lcdModelString[6];
   sprintf(lcdModelString, "%u", uint8_t(tftModel));
   WiFiManagerParameter custom_hidden_lcd("key_custom_lcd", "LCD type hidden", lcdModelString, 2);
+#endif
   char inverterModelString[6];
   sprintf(inverterModelString, "%u", uint8_t(inverterModel));
   WiFiManagerParameter custom_hidden_inverter("key_custom_inverter", "Inverter type hidden", inverterModelString, 2);
@@ -628,20 +768,25 @@ void setup_wifi()
 
   WiFiManager wifiManager;
   wifiManager.setAPCallback(configModeCallback);
-  wifiManager.setConfigPortalTimeout(WIFI_TIMEOUT);
+  wifiManager.setConfigPortalTimeout(PORTAL_TIMEOUT);
   wifiManager.setSaveConfigCallback(save_wifi_config_callback);
-  wifiManager.addParameter(&custom_hidden_lcd);
-  wifiManager.addParameter(&custom_hidden_inverter);
-  wifiManager.addParameter(&custom_hidden_mode);
-  wifiManager.addParameter(&custom_html_inputs);
+
   wifiManager.addParameter(&CUSTOM_MY_HOST);
   wifiManager.addParameter(&CUSTOM_MQTT_HOST);
   wifiManager.addParameter(&CUSTOM_MQTT_PORT);
   wifiManager.addParameter(&CUSTOM_MQTT_USER);
   wifiManager.addParameter(&CUSTOM_MQTT_PASS);
+#if defined(ESP8266)
+  wifiManager.addParameter(&custom_hidden_lcd);
+#endif
+  wifiManager.addParameter(&custom_hidden_inverter);
+  wifiManager.addParameter(&custom_hidden_mode);
+  wifiManager.addParameter(&custom_html_inputs);
 
-
-
+  wifiManager.setConnectTimeout(WIFI_TIMEOUT);
+  wifiManager.setDebugOutput(false);
+  //android fix, disable for now
+  //wifiManager.setAPStaticIPConfig(IPAddress(8,8,8,8), IPAddress(8,8,8,8), IPAddress(255,255,255,0));
   if (!wifiManager.autoConnect("Sofar2Mqtt"))
   {
     if (tftModel) {
@@ -650,7 +795,11 @@ void setup_wifi()
       updateOLED("NULL", "NULL", "WiFi.!.", "NULL");
     }
     // * Reset and try again, or maybe put it to deep sleep
+#if defined(ESP8266)
     ESP.reset();
+#elif defined(ESP32)
+    ESP.restart();
+#endif
   }
 
   // * Read updated parameters
@@ -659,7 +808,9 @@ void setup_wifi()
   strcpy(MQTT_PORT, CUSTOM_MQTT_PORT.getValue());
   strcpy(MQTT_USER, CUSTOM_MQTT_USER.getValue());
   strcpy(MQTT_PASS, CUSTOM_MQTT_PASS.getValue());
+#if defined(ESP8266)
   if (atoi(custom_hidden_lcd.getValue()) == 0) tftModel = false;
+#endif
   if (atoi(custom_hidden_inverter.getValue()) == 1) inverterModel = HYBRID;
   if (atoi(custom_hidden_inverter.getValue()) == 2) inverterModel = HYDV2;
 
@@ -677,16 +828,24 @@ void setup_wifi()
 
 
 
-void addStateInfo(String &state, unsigned int index)
+void addStateInfo(String &state, unsigned int index, unsigned int dataindex, modbusResponse *rs)
 {
-  modbusResponse	rs;
+  String stringVal;
 
-  if (readSingleReg(SOFAR_SLAVE_ID, mqtt_status_reads[index].regnum, &rs) == 0) {
-    String stringVal;
-    if (calculated) {
-      int16_t  val;
-      val = (int16_t)((rs.data[0] << 8) | rs.data[1]);
-
+  if (!calculated) {
+    if ( (mqtt_status_reads[index].valueType == U16) || (mqtt_status_reads[index].valueType == S16)) {
+      uint16_t  val;
+      val = (uint16_t)((rs->data[dataindex] << 8) | rs->data[dataindex + 1]);
+      stringVal = String(val);
+    } else {
+      uint32_t   val;
+      val = (uint32_t)((rs->data[dataindex] << 24) | (rs->data[dataindex + 1] << 16) | (rs->data[dataindex + 2] << 8) | rs->data[dataindex + 3]);
+      stringVal = String(val);
+    }
+  } else {
+    if (mqtt_status_reads[index].valueType == U16) {
+      uint16_t  val;
+      val = (uint16_t)((rs->data[dataindex] << 8) | rs->data[dataindex + 1]);
       switch (mqtt_status_reads[index].calculator) {
         case DIV10: {
             stringVal = String((float)val / 10.0);
@@ -709,24 +868,127 @@ void addStateInfo(String &state, unsigned int index)
             break;
           }
       }
-
-    } else {
-      unsigned int  val;
-      val = ((rs.data[0] << 8) | rs.data[1]);
-      stringVal = String(val);
     }
-
-    if (!( state == "{"))
-      state += ",";
-
-    state += "\"" + mqtt_status_reads[index].mqtt_name + "\":" + stringVal;
-
-    if ((mqtt_status_reads[index].mqtt_name == "batterySOC") && (tftModel)) {
-      tft.setCursor(105, 70);
-      tft.setTextSize(2);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-      tft.println(stringVal + "%  ");
+    if (mqtt_status_reads[index].valueType == S16) {
+      int16_t  val;
+      val = (int16_t)((rs->data[dataindex] << 8) | rs->data[dataindex + 1]);
+      switch (mqtt_status_reads[index].calculator) {
+        case DIV10: {
+            stringVal = String((float)val / 10.0);
+            break;
+          }
+        case DIV100: {
+            stringVal = String((float)val / 100.0);
+            break;
+          }
+        case MUL10: {
+            stringVal = String(val * 10);
+            break;
+          }
+        case MUL100: {
+            stringVal = String(val * 100);
+            break;
+          }
+        default: {
+            stringVal = String(val);
+            break;
+          }
+      }
     }
+    if (mqtt_status_reads[index].valueType == U32) {
+      uint32_t   val;
+      val = (uint32_t)((rs->data[dataindex] << 24) | (rs->data[dataindex + 1] << 16) | (rs->data[dataindex + 2] << 8) | rs->data[dataindex + 3]);
+      switch (mqtt_status_reads[index].calculator) {
+        case DIV10: {
+            stringVal = String((float)val / 10.0);
+            break;
+          }
+        case DIV100: {
+            stringVal = String((float)val / 100.0);
+            break;
+          }
+        case MUL10: {
+            stringVal = String(val * 10);
+            break;
+          }
+        case MUL100: {
+            stringVal = String(val * 100);
+            break;
+          }
+        default: {
+            stringVal = String(val);
+            break;
+          }
+      }
+    }
+    if (mqtt_status_reads[index].valueType == S32) {
+      int32_t   val;
+      val = (int32_t)((rs->data[dataindex] << 24) | (rs->data[dataindex + 1] << 16) | (rs->data[dataindex + 2] << 8) | rs->data[dataindex + 3]);
+      switch (mqtt_status_reads[index].calculator) {
+        case DIV10: {
+            stringVal = String((float)val / 10.0);
+            break;
+          }
+        case DIV100: {
+            stringVal = String((float)val / 100.0);
+            break;
+          }
+        case MUL10: {
+            stringVal = String(val * 10);
+            break;
+          }
+        case MUL100: {
+            stringVal = String(val * 100);
+            break;
+          }
+        default: {
+            stringVal = String(val);
+            break;
+          }
+      }
+    }
+  }
+
+  if (!( state == "{"))
+    state += ",";
+
+  state += "\"" + mqtt_status_reads[index].mqtt_name + "\":" + stringVal;
+
+  if ((separateMqttTopics) && (mqtt.connected())) {
+    String topic(deviceName);
+    topic += "/state/" + mqtt_status_reads[index].mqtt_name;
+    sendMqtt(const_cast<char*>(topic.c_str()), stringVal);
+  }
+
+  if ((mqtt_status_reads[index].mqtt_name == "batterySOC") && (tftModel) && (!battery2Installed)) {
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    drawCentreString("SOC: " + stringVal + "%", 120, 70);
+  }
+  if ((mqtt_status_reads[index].mqtt_name == "battery_avg_SOC") && (tftModel) && (battery2Installed)) {
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    drawCentreString("SOC: " + stringVal + "%", 120, 70);
+  }
+  if ((mqtt_status_reads[index].mqtt_name == "solarPV") && (tftModel) && (inverterModel != ME3000) ) {
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    if (!calculated) { //for the screen print we still need to calculate the correct value
+      switch (mqtt_status_reads[index].calculator) {
+        case MUL10: {
+            stringVal = String(stringVal.toInt() * 10);
+            break;
+          }
+        case MUL100: {
+            stringVal = String(stringVal.toInt() * 100);
+            break;
+          }
+        default: {
+            break;
+          }
+      }
+    }
+    drawCentreString("PV: " + stringVal + "W", 120, 230);
   }
 }
 
@@ -738,21 +1000,128 @@ void retrieveData()
   if (checkTimer(&lastRun, SEND_INTERVAL))
   {
     String	state = "{\"uptime\":" + String(millis()) + ",\"deviceName\": \"" + String(deviceName) + "\"";
-
-    if (!modbusError) {
-      for (unsigned int l = 0; l < sizeof(mqtt_status_reads) / sizeof(struct mqtt_status_register); l++)
-        if (mqtt_status_reads[l].inverter == inverterModel) {
-          addStateInfo(state, l);
-          loopRuns(); //handle some other requests while building the state info
+    if (inverterModel == ME3000) {
+      modbusResponse  rs;
+      if ((!modbusError) && ( readBulkReg(SOFAR_SLAVE_ID, ME3000_START, (ME3000_END - ME3000_START + 1), &rs) == 0)) {
+        for (unsigned int l = 0; l < sizeof(mqtt_status_reads) / sizeof(struct mqtt_status_register); l++) {
+          if (mqtt_status_reads[l].inverter == inverterModel) {
+            if ((mqtt_status_reads[l].regnum >= ME3000_START) && (mqtt_status_reads[l].regnum <= ME3000_END)) {
+              //within bulk request
+              addStateInfo(state, l, (mqtt_status_reads[l].regnum - ME3000_START) * 2, &rs);
+            } else {
+              //not in bulk request, generate single request
+              modbusResponse singleRs;
+              if (readSingleReg(SOFAR_SLAVE_ID, mqtt_status_reads[l].regnum, &singleRs) == 0) {
+                addStateInfo(state, l, 0, &singleRs);
+              }
+            }
+            loopRuns(); //handle some other requests while building the state info
+          }
         }
+      }
+    } else if (inverterModel == HYBRID) {
+      modbusResponse  rs;
+      if ((!modbusError) && ( readBulkReg(SOFAR_SLAVE_ID, HYBRID_START, (HYBRID_END - HYBRID_START + 1), &rs) == 0)) {
+        for (unsigned int l = 0; l < sizeof(mqtt_status_reads) / sizeof(struct mqtt_status_register); l++) {
+          if (mqtt_status_reads[l].inverter == inverterModel) {
+            if ((mqtt_status_reads[l].regnum >= HYBRID_START) && (mqtt_status_reads[l].regnum <= HYBRID_END)) {
+              //within bulk request
+              addStateInfo(state, l, (mqtt_status_reads[l].regnum - HYBRID_START) * 2, &rs);
+            } else {
+              //not in bulk request, generate single request
+              modbusResponse singleRs;
+              if (readSingleReg(SOFAR_SLAVE_ID, SOFAR_WORKING_MODE, &singleRs) == 0) {
+                addStateInfo(state, l, 0, &singleRs);
+              }
+            }
+            loopRuns(); //handle some other requests while building the state info
+          }
+        }
+      }
+    } else if (inverterModel == HYDV2) {
+      if (!modbusError) {
+        modbusResponse rs;
+        uint8_t cached = 0;
+        for (unsigned int l = 0; l < sizeof(mqtt_status_reads) / sizeof(struct mqtt_status_register); l++)
+          if (mqtt_status_reads[l].inverter == inverterModel) {
+            if ((mqtt_status_reads[l].regnum >= SOFAR2_SYSTEM_BEGIN) && (mqtt_status_reads[l].regnum <= SOFAR2_SYSTEM_END)) {
+              if ((cached == 1) || (readBulkReg(SOFAR_SLAVE_ID, SOFAR2_SYSTEM_BEGIN, SOFAR2_SYSTEM_END - SOFAR2_SYSTEM_BEGIN + 1, &rs) == 0) ) {
+                cached == 1;
+                addStateInfo(state, l, (mqtt_status_reads[l].regnum - SOFAR2_SYSTEM_BEGIN) * 2, &rs);
+              } else {
+                cached = 0;
+              }
+            }
+            if ((mqtt_status_reads[l].regnum >= SOFAR2_GRID_BEGIN) && (mqtt_status_reads[l].regnum <= SOFAR2_GRID_END))  {
+              if ((cached == 2) || (readBulkReg(SOFAR_SLAVE_ID, SOFAR2_GRID_BEGIN, SOFAR2_GRID_END - SOFAR2_GRID_BEGIN + 1, &rs) == 0) ) {
+                cached == 2;
+                addStateInfo(state, l, (mqtt_status_reads[l].regnum - SOFAR2_GRID_BEGIN) * 2, &rs);
+              } else {
+                cached = 0;
+              }
+            }
+            if ((mqtt_status_reads[l].regnum >= SOFAR2_PV_BEGIN) && (mqtt_status_reads[l].regnum <= SOFAR2_PV_END)) {
+              if ((cached == 3) || (readBulkReg(SOFAR_SLAVE_ID, SOFAR2_PV_BEGIN, SOFAR2_PV_END - SOFAR2_PV_BEGIN + 1, &rs) == 0) ) {
+                cached == 3;
+                addStateInfo(state, l, (mqtt_status_reads[l].regnum - SOFAR2_PV_BEGIN) * 2, &rs);
+              } else {
+                cached = 0;
+              }
+            }
+            if ((mqtt_status_reads[l].regnum >= SOFAR2_BAT_BEGIN) && (mqtt_status_reads[l].regnum <= SOFAR2_BAT_END))  {
+              if ((cached == 4) || (readBulkReg(SOFAR_SLAVE_ID, SOFAR2_BAT_BEGIN, SOFAR2_BAT_END - SOFAR2_BAT_BEGIN + 1, &rs) == 0) ) {
+                cached == 4;
+                if (mqtt_status_reads[l].regnum >= SOFAR2_REG_BATT2V) { //check with bat2 voltage if we have 2nd battery installed
+                  if (mqtt_status_reads[l].regnum == SOFAR2_REG_BATT2V) {
+                    uint16_t bat2vol = (uint16_t)((rs.data[(SOFAR2_REG_BATT2V - SOFAR2_BAT_BEGIN) * 2 ] << 8) | rs.data[(SOFAR2_REG_BATT2V - SOFAR2_BAT_BEGIN) * 2 + 1]);
+                    bat2vol > 0 ? battery2Installed = true : battery2Installed = false;
+                  }
+                  if (battery2Installed) {
+                    addStateInfo(state, l, (mqtt_status_reads[l].regnum - SOFAR2_BAT_BEGIN) * 2, &rs);
+                  }
+                }
+                else {
+                  addStateInfo(state, l, (mqtt_status_reads[l].regnum - SOFAR2_BAT_BEGIN) * 2, &rs);
+                }
+              } else {
+                cached = 0;
+              }
+            }
+            if ((mqtt_status_reads[l].regnum >= SOFAR2_POW_BEGIN) && (mqtt_status_reads[l].regnum <= SOFAR2_POW_END))  {
+              if ((cached == 5) || (readBulkReg(SOFAR_SLAVE_ID, SOFAR2_POW_BEGIN, SOFAR2_POW_END - SOFAR2_POW_BEGIN + 1, &rs) == 0) ) {
+                cached == 5;
+                addStateInfo(state, l, (mqtt_status_reads[l].regnum - SOFAR2_POW_BEGIN) * 2, &rs);
+              } else {
+                cached = 0;
+              }
+            }
+            //for some unknown reason this register can't be get in BULK
+            if (mqtt_status_reads[l].regnum == SOFAR2_REG_PVW) {
+              cached == 0;
+              if (readSingleReg(SOFAR_SLAVE_ID, SOFAR2_REG_PVW, &rs) == 0) {
+                addStateInfo(state, l, 0, &rs);
+              }
+            }
+            if (mqtt_status_reads[l].regnum == SOFAR2_WORKING_MODE) {
+              cached == 0;
+              if (readSingleReg(SOFAR_SLAVE_ID, SOFAR2_WORKING_MODE, &rs) == 0) {
+                addStateInfo(state, l, 0, &rs);
+              }
+            }
+            loopRuns(); //handle some other requests while building the state info
+          }
+      }
     }
+
     state = state + "}";
 
-    //Prefix the mqtt topic name with deviceName.
-    String topic(deviceName);
-    topic += "/state";
-    if (mqtt.connected()) sendMqtt(const_cast<char*>(topic.c_str()), state);
-    state.toCharArray(jsonstring, sizeof(jsonstring));
+    { //Prefix the mqtt topic name with deviceName.
+      String topic(deviceName);
+      topic += "/state";
+      if (mqtt.connected()) sendMqtt(const_cast<char*>(topic.c_str()), state);
+      state.toCharArray(jsonstring, sizeof(jsonstring));
+    }
+
   }
 }
 
@@ -771,20 +1140,116 @@ void mqttCallback(String topic, byte *message, unsigned int length)
     messageTemp += (char)message[i];
   }
 
+  if (cmd == "modbus") {
+
+    modbusResponse rs;
+    sendModbus(message, length, &rs);
+    char buffer[256];
+    buffer[256] = '\0';
+    for (int j = 0; ((j < rs.frameSize)); j++) {
+      sprintf(&buffer[3 * j], "%02X ", rs.frame[j]);
+    }
+    String topic(deviceName);
+    topic += "/response/modbus";
+    mqtt.publish(topic.c_str(), buffer);
+    return;
+  }
+
+  if (cmd == "mode_control") { //only for HYDV2
+    if (inverterModel == HYDV2) {
+      modbusResponse  rs;
+      int16_t data = messageTemp.toInt();
+      uint16_t addr = 0x1110;
+      uint8_t frame[] = { SOFAR_SLAVE_ID, MODBUS_FN_WRITEMULREG, (addr >> 8) & 0xff, addr & 0xff, 0, 1, 2, 0, data, 0, 0};
+      String retMsg;
+      if (sendModbus(frame, sizeof(frame), &rs))
+        retMsg = rs.errorMessage;
+      else if (rs.dataSize != 2)
+        retMsg = "Reponse is " + String(rs.dataSize) + " bytes?";
+      else
+      {
+        retMsg = String((rs.data[0] << 8) | (rs.data[1] & 0xff));
+      }
+
+      String topic(deviceName);
+      topic += "/response/mode_control";
+      sendMqtt(const_cast<char*>(topic.c_str()), retMsg);
+    }
+    return;
+
+  }
+
+  if ((cmd == "threephaselimit") || (cmd == "antireflux")) {
+    uint16_t addr = inverterModel == HYDV2 ? SOFAR2_ANTIREFLUX_CONTROL : SOFAR_ANTIREFLUX_CONTROL;
+    if (messageTemp == "off") {
+      modbusResponse  rs;
+      uint8_t frame[] = { SOFAR_SLAVE_ID, MODBUS_FN_WRITEMULREG, (addr >> 8) & 0xff, addr & 0xff, 0, 2, 4, 0, 0, 0, 0, 0, 0};
+      String retMsg;
+      if (sendModbus(frame, sizeof(frame), &rs))
+        retMsg = rs.errorMessage;
+      else if (rs.dataSize != 2)
+        retMsg = "Reponse is " + String(rs.dataSize) + " bytes?";
+      else
+      {
+        retMsg = String((rs.data[0] << 8) | (rs.data[1] & 0xff));
+      }
+
+      String topic(deviceName);
+      topic += "/response/" + cmd;
+      sendMqtt(const_cast<char*>(topic.c_str()), retMsg);
+    } else {
+      modbusResponse  rs;
+      int16_t data = messageTemp.toInt();
+      uint8_t control = ((cmd == "threephaselimit") && (inverterModel == HYDV2)) ? 2 : 1;
+      uint8_t frame[] = { SOFAR_SLAVE_ID, MODBUS_FN_WRITEMULREG, (addr >> 8) & 0xff, addr & 0xff, 0, 2, 4, 0, control, (data >> 8) & 0xff, data & 0xff, 0, 0};
+      String retMsg;
+      if (sendModbus(frame, sizeof(frame), &rs))
+        retMsg = rs.errorMessage;
+      else if (rs.dataSize != 2)
+        retMsg = "Reponse is " + String(rs.dataSize) + " bytes?";
+      else
+      {
+        retMsg = String((rs.data[0] << 8) | (rs.data[1] & 0xff));
+      }
+
+      String topic(deviceName);
+      topic += "/response/" + cmd;
+      sendMqtt(const_cast<char*>(topic.c_str()), retMsg);
+    }
+    return;
+  }
+
+
+
+  if (cmd == "remote_control") { //only for HYDV2
+    if (inverterModel == HYDV2) {
+      modbusResponse  rs;
+      int16_t data = messageTemp.toInt();
+      uint16_t addr = 0x1104;
+      uint8_t frame[] = { SOFAR_SLAVE_ID, MODBUS_FN_WRITEMULREG, (addr >> 8) & 0xff, addr & 0xff, 0, 1, 2, 0, data, 0, 0};
+      String retMsg;
+      if (sendModbus(frame, sizeof(frame), &rs))
+        retMsg = rs.errorMessage;
+      else if (rs.dataSize != 2)
+        retMsg = "Reponse is " + String(rs.dataSize) + " bytes?";
+      else
+      {
+        retMsg = String((rs.data[0] << 8) | (rs.data[1] & 0xff));
+      }
+
+      String topic(deviceName);
+      topic += "/response/remote_control";
+      sendMqtt(const_cast<char*>(topic.c_str()), retMsg);
+    }
+    return;
+  }
+
   int   messageValue = messageTemp.toInt();
   bool  messageBool = ((messageTemp != "false") && (messageTemp != "battery_save"));
 
   switch (inverterModel) {
     case HYDV2: {
-        if (cmd == "standby") {
-          sendPassiveCmdV2(SOFAR_SLAVE_ID, SOFAR2_REG_PASSIVECONTROL, 0, cmd);
-        } else if (cmd == "auto") {
-        } else if ((cmd == "charge") || (cmd == "discharge")) {
-          if (cmd == "discharge") {
-            messageValue = messageValue * -1;
-          }
-          sendPassiveCmdV2(SOFAR_SLAVE_ID, SOFAR2_REG_PASSIVECONTROL, messageValue, cmd);
-        }
+        sendPassiveCmdV2(SOFAR_SLAVE_ID, SOFAR2_REG_PASSIVECONTROL, messageValue, cmd);
         break;
       }
     default: {
@@ -803,7 +1268,7 @@ void mqttCallback(String topic, byte *message, unsigned int length)
           else if (messageTemp == "battery_save")
             BATTERYSAVE = true;
         }
-        else if ((messageValue > 0) && (messageValue <= MAX_POWER))
+        else if (messageValue > 0)
         {
           fnParam = messageValue;
 
@@ -824,6 +1289,84 @@ void mqttCallback(String topic, byte *message, unsigned int length)
   }
 }
 
+int peakShavingLimitImport = 0;
+int peakShavingLimitExport = 0;
+int peakShavingBatteryPower = 0;
+void peakShaving() 
+{
+  static unsigned long  lastRun = 0;
+
+  if (checkTimer(&lastRun, PEAKSHAVING_INTERVAL) && PEAKSHAVING)
+  {
+    modbusResponse  rs;
+
+    //Get grid power
+    int16_t  gridPower = 0;
+
+    if (readSingleReg(SOFAR_SLAVE_ID, SOFAR_REG_GRIDW, &rs) == 0) {
+      gridPower = (int16_t)((rs.data[0] << 8) | rs.data[1]) * 10;
+      if (gridPower < peakShavingLimitImport) {
+        peakShavingBatteryPower += (gridPower - peakShavingLimitImport); //gridpower import is negative, limit should also be stored as negative
+      } else if (gridPower > peakShavingLimitExport) {
+        peakShavingBatteryPower += (gridPower - peakShavingLimitExport);
+      }
+      if (peakShavingBatteryPower > 0) {
+        //charge
+        if (peakShavingBatteryPower > MAX_POWER) {
+          peakShavingBatteryPower == MAX_POWER;
+        }
+        sendPassiveCmd(SOFAR_SLAVE_ID, SOFAR_FN_CHARGE, (uint16_t)peakShavingBatteryPower, "charge");
+      } else if (peakShavingBatteryPower < 0) {
+        //discharge
+        if (peakShavingBatteryPower < (-1 * MAX_POWER)) {
+          peakShavingBatteryPower == (-1 * MAX_POWER);
+        }
+        sendPassiveCmd(SOFAR_SLAVE_ID, SOFAR_FN_DISCHARGE, (uint16_t)(peakShavingBatteryPower * -1), "discharge");
+      } else {
+        //standby
+        sendPassiveCmd(SOFAR_SLAVE_ID, SOFAR_FN_STANDBY, SOFAR_PARAM_STANDBY, "standby");
+      }
+    }
+  }
+}
+
+int selfuseBatteryPower = 0;
+void selfuseMode()
+{
+  static unsigned long  lastRun = 0;
+
+  if (checkTimer(&lastRun, SELFUSE_INTERVAL) && SELFUSEMODE)
+  {
+    modbusResponse  rs;
+
+    //Get grid power
+    int16_t  gridPower = 0;
+
+    if (readSingleReg(SOFAR_SLAVE_ID, SOFAR_REG_GRIDW, &rs) == 0) {
+      gridPower = (int16_t)((rs.data[0] << 8) | rs.data[1]) * 10;
+      selfuseBatteryPower += gridPower;  //gridPower negative is import, so selfuse should be calculated towards discharge (also negative)
+      if (selfuseBatteryPower > 0) {
+        //charge
+        if (selfuseBatteryPower > MAX_POWER) {
+          selfuseBatteryPower == MAX_POWER;
+        }
+        sendPassiveCmd(SOFAR_SLAVE_ID, SOFAR_FN_CHARGE, (uint16_t)peakShavingBatteryPower, "charge");
+      } else if (selfuseBatteryPower < 0) {
+        //discharge
+        if (selfuseBatteryPower < (-1 * MAX_POWER)) {
+          selfuseBatteryPower == (-1 * MAX_POWER);
+        }
+        sendPassiveCmd(SOFAR_SLAVE_ID, SOFAR_FN_DISCHARGE, (uint16_t)(selfuseBatteryPower * -1), "discharge");
+      } else {
+        //standby
+        sendPassiveCmd(SOFAR_SLAVE_ID, SOFAR_FN_STANDBY, SOFAR_PARAM_STANDBY, "standby");
+      }
+    }
+  }
+}
+
+
+
 void batterySave()
 {
   static unsigned long	lastRun = 0;
@@ -835,7 +1378,7 @@ void batterySave()
     //Get grid power
     unsigned int	p = 0;
 
-    if (readSingleReg(SOFAR_SLAVE_ID, SOFAR_REG_GRIDW, &rs)) {
+    if (readSingleReg(SOFAR_SLAVE_ID, SOFAR_REG_GRIDW, &rs) == 0) {
       p = ((rs.data[0] << 8) | rs.data[1]);
 
       // Switch to auto when any power flows to the grid.
@@ -856,7 +1399,7 @@ void batterySave()
   }
 }
 
-// This function reconnects the ESP8266 to the MQTT broker
+// This function reconnects the module to the MQTT broker
 void mqttReconnect()
 {
   unsigned long now = millis();
@@ -876,21 +1419,11 @@ void mqttReconnect()
       } else {
         updateOLED("NULL", "Online", "NULL", "NULL");
       }
-      //Set topic names to include the deviceName.
-      String standbyMode(deviceName);
-      standbyMode += "/set/standby";
-      String autoMode(deviceName);
-      autoMode += "/set/auto";
-      String chargeMode(deviceName);
-      chargeMode += "/set/charge";
-      String dischargeMode(deviceName);
-      dischargeMode += "/set/discharge";
-
+      //subscribe to set topics
+      String settopics(deviceName);
+      settopics += "/set/#";
       // Subscribe or resubscribe to topics.
-      mqtt.subscribe(const_cast<char*>(standbyMode.c_str()));
-      mqtt.subscribe(const_cast<char*>(autoMode.c_str()));
-      mqtt.subscribe(const_cast<char*>(chargeMode.c_str()));
-      mqtt.subscribe(const_cast<char*>(dischargeMode.c_str()));
+      mqtt.subscribe(const_cast<char*>(settopics.c_str()));
     }
   }
 }
@@ -903,7 +1436,7 @@ void flushRS485()
 {
   if (tftModel) {
     Serial.flush();
-    delay(200);
+    delay(20);
 
     while (Serial.available())
       Serial.read();
@@ -939,9 +1472,7 @@ int sendModbus(uint8_t frame[], byte frameSize, modbusResponse *resp)
 // Listen for a response.
 int listen(modbusResponse *resp)
 {
-  uint8_t		inFrame[64];
   uint8_t		inByteNum = 0;
-  uint8_t		inFrameSize = 0;
   uint8_t		inFunctionCode = 0;
   uint8_t		inDataBytes = 0;
   int		done = 0;
@@ -951,18 +1482,19 @@ int listen(modbusResponse *resp)
     resp = &dummy;      // Just in case we ever want to interpret here.
 
   resp->dataSize = 0;
+  resp->frameSize = 0;
   resp->errorLevel = 0;
 
-  while ((!done) && (inByteNum < sizeof(inFrame)))
+  while ((!done) && (inByteNum < MAX_FRAME_SIZE))
   {
     int tries = 0;
 
     if (tftModel) {
       while ((!Serial.available()) && (tries++ < RS485_TRIES))
-        delay(50);
+        delay(10);
     } else {
       while ((!RS485Serial.available()) && (tries++ < RS485_TRIES))
-        delay(50);
+        delay(10);
     }
 
     if (tries >= RS485_TRIES)
@@ -971,27 +1503,29 @@ int listen(modbusResponse *resp)
     }
 
     if (tftModel) {
-      inFrame[inByteNum] = Serial.read();
+      resp->frame[inByteNum] = Serial.read();
     } else {
-      inFrame[inByteNum] = RS485Serial.read();
+      resp->frame[inByteNum] = RS485Serial.read();
     }
+
+    
 
     //Process the byte
     switch (inByteNum)
     {
       case 0:
-        if (inFrame[inByteNum] != SOFAR_SLAVE_ID)  //If we're looking for the first byte but it dosn't match the slave ID, we're just going to drop it.
+        if (resp->frame[inByteNum] != SOFAR_SLAVE_ID)  //If we're looking for the first byte but it dosn't match the slave ID, we're just going to drop it.
           inByteNum--;          // Will be incremented again at the end of the loop.
         break;
 
       case 1:
         //This is the second byte in a frame, where the function code lives.
-        inFunctionCode = inFrame[inByteNum];
+        inFunctionCode = resp->frame[inByteNum];
         break;
 
       case 2:
         //This is the third byte in a frame, which tells us the number of data bytes to follow.
-        if ((inDataBytes = inFrame[inByteNum]) > sizeof(inFrame))
+        if ((inDataBytes = resp->frame[inByteNum]) > MAX_FRAME_SIZE)
           inByteNum = -1;       // Frame is too big?
         break;
 
@@ -999,7 +1533,7 @@ int listen(modbusResponse *resp)
         if (inByteNum < inDataBytes + 3)
         {
           //This is presumed to be a data byte.
-          resp->data[inByteNum - 3] = inFrame[inByteNum];
+          resp->data[inByteNum - 3] = resp->frame[inByteNum];
           resp->dataSize++;
         }
         else if (inByteNum > inDataBytes + 3)
@@ -1009,18 +1543,18 @@ int listen(modbusResponse *resp)
     inByteNum++;
   }
 
-  inFrameSize = inByteNum;
-
+  resp->frameSize = inByteNum;
+   
   /**
     Now check to see if the last two bytes are a valid CRC.
     If we don't have a response pointer we don't care.
   **/
-  if (inFrameSize < 5)
+  if (resp->frameSize < 5)
   {
     resp->errorLevel = 2;
     resp->errorMessage = "Response too short";
   }
-  else if (checkCRC(inFrame, inFrameSize))
+  else if (checkCRC(resp->frame, resp->frameSize))
   {
     resp->errorLevel = 0;
     resp->errorMessage = "Valid data frame";
@@ -1034,14 +1568,19 @@ int listen(modbusResponse *resp)
   return -resp->errorLevel;
 }
 
-int readSingleReg(uint8_t id, uint16_t reg, modbusResponse *rs)
+int readBulkReg(uint8_t id, uint16_t reg, uint8_t bulkSize, modbusResponse *rs)
 {
-  uint8_t	frame[] = { id, MODBUS_FN_READSINGLEREG, reg >> 8, reg & 0xff, 0, 0x01, 0, 0 };
-
+  uint8_t  frame[] = { id, MODBUS_FN_READHOLDINGREG, reg >> 8, reg & 0xff, 0, bulkSize, 0, 0 };
   return sendModbus(frame, sizeof(frame), rs);
 }
 
-int sendPassiveCmdV2(uint8_t id, uint16_t cmd, int32_t param, String pubTopic) {
+int readSingleReg(uint8_t id, uint16_t reg, modbusResponse *rs)
+{
+  uint8_t	frame[] = { id, MODBUS_FN_READHOLDINGREG, reg >> 8, reg & 0xff, 0, 0x01, 0, 0 };
+  return sendModbus(frame, sizeof(frame), rs);
+}
+
+int sendPassiveCmdV2(uint8_t id, uint16_t cmd, int32_t param, String requestCmd) {
   /*SOFAR2_REG_PASSIVECONTROL
     need to be finished and checked
     writes to 4487 - 4492 with 6x 32-bit integers
@@ -1050,8 +1589,26 @@ int sendPassiveCmdV2(uint8_t id, uint16_t cmd, int32_t param, String pubTopic) {
     4491 = max passive power
     but 4487 isn't for forced passive mode. Set min and max to same value for that. Negative is discharging
   */
+  int32_t minPower = 0, maxPower = 0;
+  if (requestCmd == "standby") { //keep min and max at 0
+  } else if (requestCmd == "auto") { //set "window" of discharge/charge and it will emulate auto mode
+    if (param > 0) {
+      minPower = param * -1;
+      maxPower = param;
+    } else { //set a default window of 16kW (dis)charge
+      minPower = -16384;
+      maxPower = 16383;
+    }
+  } else if ((requestCmd == "charge") || (requestCmd == "discharge")) {
+    minPower = param;
+    if (requestCmd == "discharge") {
+      minPower = minPower * -1;
+    }
+    maxPower = minPower;
+  }
+
   modbusResponse  rs;
-  uint8_t frame[] = { id, MODBUS_FN_WRITEMULREG, (cmd >> 8) & 0xff, cmd & 0xff, 0, 6, 12, 0, 0, 0, 0, (param >> 24) & 0xff, (param >> 16) & 0xff, (param >> 8) & 0xff, param & 0xff, (param >> 25) & 0xff, (param >> 16) & 0xff, (param >> 8) & 0xff, param & 0xff, 0, 0 };
+  uint8_t frame[] = { id, MODBUS_FN_WRITEMULREG, (cmd >> 8) & 0xff, cmd & 0xff, 0, 6, 12, 0, 0, 0, 0, (minPower >> 24) & 0xff, (minPower >> 16) & 0xff, (minPower >> 8) & 0xff, minPower & 0xff, (maxPower >> 24) & 0xff, (maxPower >> 16) & 0xff, (maxPower >> 8) & 0xff, maxPower & 0xff, 0, 0 };
   int   err = -1;
   String    retMsg;
 
@@ -1065,10 +1622,20 @@ int sendPassiveCmdV2(uint8_t id, uint16_t cmd, int32_t param, String pubTopic) {
     err = 0;
   }
 
-  String topic(deviceName);
-  topic += "/response/" + pubTopic;
-  sendMqtt(const_cast<char*>(topic.c_str()), retMsg);
+  char mqtt_topic[256];
+  sprintf_P(mqtt_topic, PSTR("%s/response/%s"), deviceName, requestCmd);
+  sendMqtt(mqtt_topic, retMsg);
   return err;
+}
+
+void sendMqtt(char* topic, String msg_str)
+{
+  char  msg[2000];
+
+  mqtt.setBufferSize(2048);
+  msg_str.toCharArray(msg, msg_str.length() + 1); //packaging up the data to publish to mqtt
+  if (!(mqtt.publish(topic, msg)))
+    printScreen("MQTT publish failed");
 }
 
 int sendPassiveCmd(uint8_t id, uint16_t cmd, uint16_t param, String pubTopic)
@@ -1089,20 +1656,10 @@ int sendPassiveCmd(uint8_t id, uint16_t cmd, uint16_t param, String pubTopic)
     err = 0;
   }
 
-  String topic(deviceName);
-  topic += "/response/" + pubTopic;
-  sendMqtt(const_cast<char*>(topic.c_str()), retMsg);
+  char mqtt_topic[256];
+  sprintf_P(mqtt_topic, PSTR("%s/response/%s"), deviceName, pubTopic);
+  sendMqtt(mqtt_topic, retMsg);
   return err;
-}
-
-void sendMqtt(char* topic, String msg_str)
-{
-  char	msg[1000];
-
-  mqtt.setBufferSize(1024);
-  msg_str.toCharArray(msg, msg_str.length() + 1); //packaging up the data to publish to mqtt
-  if (!(mqtt.publish(topic, msg)))
-    printScreen("MQTT publish failed");
 }
 
 
@@ -1246,6 +1803,16 @@ void runStateHYBRID() { //same for v2
 
 }
 
+void drawCentreString(const String &buf, int x, int y)
+{
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(buf, x, y, &x1, &y1, &w, &h); //calc width of new string
+  tft.setCursor(0, y);
+  tft.print("                           ");
+  tft.setCursor(x - w / 2, y);
+  tft.print(buf);
+}
 
 void updateRunstate()
 {
@@ -1286,11 +1853,12 @@ void updateRunstate()
 
 int16_t batteryWatts()
 {
-  uint16_t reg = inverterModel == HYDV2 ? SOFAR2_REG_BATTW : SOFAR_REG_BATTW;
+  uint16_t reg = inverterModel == HYDV2 ? SOFAR2_REG_BATTTOTALW : SOFAR_REG_BATTW;
   modbusResponse  response;
   if (!readSingleReg(SOFAR_SLAVE_ID, reg, &response))
   {
     int16_t  w = (int16_t)((response.data[0] << 8) | response.data[1]) * 10;
+    if (inverterModel == HYDV2) w = w * 10;
     return w;
   }
   return 0;
@@ -1394,7 +1962,7 @@ void handleRoot() {
 
 // Webserver root page
 void handleSettings() {
-  httpServer.send_P(200, "text/html", settings_html);
+  httpServer.send_P(200, "text/html", settings_html_new);
 }
 
 void handleJson()
@@ -1423,6 +1991,8 @@ void handleJsonSettings()
   jsonsettingsstring += "\"calculated\": \"" + String(calculated) + "\"";
   jsonsettingsstring += ",";
   jsonsettingsstring += "\"screendimtimer\": \"" + String(screenDimTimer) + "\"";
+  jsonsettingsstring += ",";
+  jsonsettingsstring += "\"separateMqttTopics\": \"" + String(separateMqttTopics) + "\"";
   jsonsettingsstring += "}";
 
   httpServer.send(200, "application/json", jsonsettingsstring);
@@ -1436,7 +2006,11 @@ void handleCommand() {
     if ((httpServer.argName(i) == "reset") || (httpServer.argName(i) == "restart") || (httpServer.argName(i) == "reboot") || ((httpServer.argName(i) == "reload"))) {
       httpServer.send(200, "text/html", "<html><head><meta http-equiv=\"refresh\" content=\"2; URL=/\" /></head><body>Restarting!</body></html>");
       delay(1000);
+#if defined(ESP8266)
       ESP.reset();
+#elif defined(ESP32)
+      ESP.restart();
+#endif
     } else if (httpServer.argName(i) == "factoryreset") {
       httpServer.send(200, "text/html", "<html><head><meta http-equiv=\"refresh\" content=\"2; URL=/\" /></head><body>Factory reset! Please reconfig using wifi hotspot!</body></html>");
       delay(1000);
@@ -1477,6 +2051,7 @@ void handleCommand() {
         inverterModel = HYDV2;
       }
       saveEeprom = true;
+#if defined(ESP8266)
     } else if (httpServer.argName(i) == "tftModel") {
       String value =  httpServer.arg(i);
       message += "Setting lcd type to: " + value + "<br>";
@@ -1486,6 +2061,7 @@ void handleCommand() {
         tftModel = true;
       }
       saveEeprom = true;
+#endif
     } else if (httpServer.argName(i) == "calculated") {
       String value =  httpServer.arg(i);
       message += "Setting calculated mode to: " + value + "<br>";
@@ -1499,6 +2075,15 @@ void handleCommand() {
       String value =  httpServer.arg(i);
       message += "Setting screen dim timer to: " + value + "<br>";
       screenDimTimer = value.toInt();
+      saveEeprom = true;
+    } else if (httpServer.argName(i) == "separateMqttTopics") {
+      String value =  httpServer.arg(i);
+      message += "Setting separateMqttTopics to: " + value + "<br>";
+      if (value == "true") {
+        separateMqttTopics = true;
+      } else {
+        separateMqttTopics = false;
+      }
       saveEeprom = true;
     }
 
@@ -1517,9 +2102,16 @@ void handleCommand() {
 
 void resetConfig() {
   //initiate debug led indication for factory reset
+#if defined(ESP8266)
   pinMode(2, FUNCTION_0); //set it as gpio
   pinMode(2, OUTPUT);
   digitalWrite(2, LOW); //blue led on
+#else if defined(ESP32)
+  pinMode(20, OUTPUT);
+  digitalWrite(20, LOW); //tx led on
+  pinMode(21, OUTPUT);
+  digitalWrite(21, LOW); //rx led on
+#endif
   if (tftModel) {
     analogWrite(TFT_LED, 32); //PWM on led pin to dim screen
     tft.fillScreen(ILI9341_RED);
@@ -1528,9 +2120,9 @@ void resetConfig() {
     tft.setTextColor(ILI9341_RED, ILI9341_BLACK); // Red on black
     tft.println("Double reset detected, clearing config.");
   }
-  WiFi.persistent(true);
-  WiFi.disconnect();
-  WiFi.persistent(false);
+  //WiFi.persistent(true);
+  //WiFi.disconnect();
+  //WiFi.persistent(false);
   WiFiManager wifiManager;
   wifiManager.resetSettings();
   EEPROM.begin(512);
@@ -1542,15 +2134,25 @@ void resetConfig() {
   }
 
   while (true) {
+#if defined(ESP8266)
     digitalWrite(2, HIGH);
     delay(100);
     digitalWrite(2, LOW);
     delay(100);
+#else if defined(ESP32)
+    digitalWrite(20, HIGH);
+    digitalWrite(21, LOW);
+    delay(100);
+    digitalWrite(21, HIGH);
+    digitalWrite(20, LOW);
+    delay(100);
+#endif
   }
 }
 
 void doubleResetDetect() {
-  if (drd.detect()) {
+  drd = new DoubleResetDetector(DRD_TIMEOUT, DRD_ADDRESS);
+  if (drd->detectDoubleReset()) {
     if (tftModel) {
       tft.begin();
       tft.setRotation(2);
@@ -1563,14 +2165,17 @@ void setup()
 {
   // * Configure EEPROM an get initial settings
   EEPROM.begin(512);
-  if (!loadFromEeprom()) { //we don't have config yet, switch between lcd models after each reset
+#if defined(ESP8266)
+  if (!loadFromEeprom()) { //we don't have config yet, switch between lcd models after each reset, only for ESP8266
     tftModel = true;
     if (EEPROM.read(200)) tftModel = false; //previous reboot we selected TFT model, now switch to OLED
     EEPROM.write(200, tftModel); // * 200
     EEPROM.commit();
   }
+#else
+  loadFromEeprom();
+#endif
   doubleResetDetect(); //detect factory reset first
-
   if (tftModel) {
     tft.begin();
     tft.setRotation(2);
@@ -1592,13 +2197,43 @@ void setup()
   }
 
   if (tftModel) {
-    Serial.begin(9600);
+/*
+    if (HYDV2) {
+      //these models work better on higher baud because of the amount of data that is received
+      //this routine checks if the inverter is already on the higher and if not tries to switch it to that speed
+      tft.println("Start checking modbus baudrate");
+      Serial.begin(57600);
+      modbusResponse rs;
+      if (readBulkReg(SOFAR_SLAVE_ID, 0x100b, 5, &rs) != 0) {
+        tft.println("Not responding on high baudrate");
+        //inverter not responding, try to check if inverter is responding on 9600 baud
+        Serial.begin(9600);
+        if (readBulkReg(SOFAR_SLAVE_ID, 0x100b, 5, &rs) == 0) {
+          tft.println("Switching to higher baudrate");
+          //it responded, so try to switch to 57600 baud now
+          uint8_t frame[] = { SOFAR_SLAVE_ID, MODBUS_FN_WRITEMULREG, 0x10, 0x0b, 0, 5, 10, 0, SOFAR_SLAVE_ID, 0, 4, 0, 0, 0, 0, 0, 1, 0, 0};
+          sendModbus(frame, sizeof(frame), &rs);
+          delay(1000);
+          Serial.begin(57600);
+          if (readBulkReg(SOFAR_SLAVE_ID, 0x100b, 5, &rs) != 0) {
+            tft.println("Switching failed, keep lower baudrate");
+            //it didn't respond so head back to 9600 baud
+            Serial.begin(9600);
+          }
+        }
+      }
+      delay(1000);
+    } else {
+*/      
+      Serial.begin(9600);
+    //}
   } else {
     pinMode(SERIAL_COMMUNICATION_CONTROL_PIN, OUTPUT);
     digitalWrite(SERIAL_COMMUNICATION_CONTROL_PIN, RS485_RX);
     RS485Serial.begin(9600);
   }
   delay(500);
+  drd->stop();
   setup_wifi(); //set wifi and get settings, so first thing to do
 
   if (tftModel) {
@@ -1664,8 +2299,11 @@ void tsLoop() {
 void loopRuns() {
   ArduinoOTA.handle();
   httpServer.handleClient();
+#if defined(ESP8266)
   MDNS.update();
-  tsLoop();
+#endif
+  if (tftModel) tsLoop();
+  if (mqtt.connected()) mqtt.loop();
 }
 
 void loop()
@@ -1724,5 +2362,5 @@ bool checkCRC(uint8_t frame[], byte frameSize)
   received_crc = ((frame[frameSize - 2] << 8) | frame[frameSize - 1]);
   calcCRC(frame, frameSize);
   calculated_crc = ((frame[frameSize - 2] << 8) | frame[frameSize - 1]);
-  return (received_crc = calculated_crc);
+  return (received_crc == calculated_crc);
 }
