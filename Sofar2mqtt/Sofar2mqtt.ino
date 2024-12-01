@@ -1,7 +1,7 @@
 // The device name is used as the MQTT base topic. If you need more than one Sofar2mqtt on your network, give them unique names.
 const char* version = "v3.8";
 
-bool tftModel = true; //true means 2.8" color tft, false for oled version. This is always true for ESP32 devices as we don't use oled device for esp32.
+bool tftModel = false; //true means 2.8" color tft, false for oled version. This is always true for ESP32 devices as we don't use oled device for esp32.
 
 bool calculated = true; //default to pre-calculated values before sending to mqtt
 
@@ -286,9 +286,9 @@ static struct mqtt_status_register  mqtt_status_reads[] =
   { ME3000, SOFAR_WORKING_MODE, "working_mode", U16, NOCALC},
   { HYBRID, SOFAR_REG_RUNSTATE, "running_state", U16, NOCALC },
   { HYBRID, SOFAR_REG_GRIDV, "grid_voltage", U16, DIV10 },
-  { HYBRID, SOFAR_REG_GRIDA, "grid_current", S16, DIV100 },
-  { HYBRID, SOFAR_REG_GRIDFREQ, "grid_freq", U16, DIV100 },
-  { HYBRID, SOFAR_REG_GRIDW, "grid_power", S16, MUL10 },
+//  { HYBRID, SOFAR_REG_GRIDA, "grid_current", S16, DIV100 },
+//  { HYBRID, SOFAR_REG_GRIDFREQ, "grid_freq", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_GRIDW, "grid_power", S16, MUL10 },
   { HYBRID, SOFAR_REG_BATTW, "battery_power", S16, MUL10 },
   { HYBRID, SOFAR_REG_BATTV, "battery_voltage", U16, DIV10 },
   { HYBRID, SOFAR_REG_BATTA, "battery_current", S16, DIV100 },
@@ -298,22 +298,22 @@ static struct mqtt_status_register  mqtt_status_reads[] =
   { HYBRID, SOFAR_REG_BATTTEMP, "battery_temp", S16, NOCALC },
   { HYBRID, SOFAR_REG_BATTCYC, "battery_cycles", U16, NOCALC },
   { HYBRID, SOFAR_REG_LOADW, "consumption", S16, MUL10 },
-  { HYBRID, SOFAR_REG_PVW, "solarPV", U16, MUL10 },
-  { HYBRID, SOFAR_REG_PVA, "solarPVAmps", U16, NOCALC },
-  { HYBRID, SOFAR_REG_PV1, "solarPV1", U16, MUL10 },
-  { HYBRID, SOFAR_REG_PV2, "solarPV2", U16, MUL10 },
-  { HYBRID, SOFAR_REG_PVDAY, "today_generation", U16, DIV100 },
-  { HYBRID, SOFAR_REG_LOADDAY, "today_consumption", U16, DIV100 },
-  { HYBRID, SOFAR_REG_EXPDAY, "today_exported", U16, DIV100 },
-  { HYBRID, SOFAR_REG_IMPDAY, "today_purchase", U16, DIV100 },
-  { HYBRID, SOFAR_REG_CHARGDAY, "today_charged", U16, DIV100 },
-  { HYBRID, SOFAR_REG_DISCHDAY, "today_discharged", U16, DIV100 },
-  { HYBRID, SOFAR_REG_PVTOTAL, "total_generation", U32, COMBINE },
-  { HYBRID, SOFAR_REG_LOADTOTAL, "total_consumption", U32, COMBINE },
-  { HYBRID, SOFAR_REG_EXPTOTAL, "total_exported", U32, COMBINE },
-  { HYBRID, SOFAR_REG_IMPTOTAL, "total_purchase", U32, COMBINE },
-  { HYBRID, SOFAR_REG_CHARGTOTAL, "total_charged", U32, COMBINE },
-  { HYBRID, SOFAR_REG_DISCHTOTAL, "total_discharged", U32, COMBINE },
+//  { HYBRID, SOFAR_REG_PVW, "solarPV", U16, MUL10 },
+//  { HYBRID, SOFAR_REG_PVA, "solarPVAmps", U16, NOCALC },
+//  { HYBRID, SOFAR_REG_PV1, "solarPV1", U16, MUL10 },
+//  { HYBRID, SOFAR_REG_PV2, "solarPV2", U16, MUL10 },
+//  { HYBRID, SOFAR_REG_PVDAY, "today_generation", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_LOADDAY, "today_consumption", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_EXPDAY, "today_exported", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_IMPDAY, "today_purchase", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_CHARGDAY, "today_charged", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_DISCHDAY, "today_discharged", U16, DIV100 },
+//  { HYBRID, SOFAR_REG_PVTOTAL, "total_generation", U32, COMBINE },
+//  { HYBRID, SOFAR_REG_LOADTOTAL, "total_consumption", U32, COMBINE },
+//  { HYBRID, SOFAR_REG_EXPTOTAL, "total_exported", U32, COMBINE },
+//  { HYBRID, SOFAR_REG_IMPTOTAL, "total_purchase", U32, COMBINE },
+//  { HYBRID, SOFAR_REG_CHARGTOTAL, "total_charged", U32, COMBINE },
+//  { HYBRID, SOFAR_REG_DISCHTOTAL, "total_discharged", U32, COMBINE },
   { HYBRID, SOFAR_REG_INTTEMP, "inverter_temp", S16, NOCALC },
   { HYBRID, SOFAR_REG_HSTEMP, "inverter_HStemp", S16, NOCALC },
   { HYBRID, SOFAR_WORKING_MODE, "working_mode", U16, NOCALC},
@@ -1268,7 +1268,7 @@ void mqttCallback(String topic, byte *message, unsigned int length)
           else if (messageTemp == "battery_save")
             BATTERYSAVE = true;
         }
-        else if (messageValue > 0)
+        else if (messageValue >= 0)
         {
           fnParam = messageValue;
 
