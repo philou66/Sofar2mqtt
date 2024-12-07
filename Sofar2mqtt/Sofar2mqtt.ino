@@ -368,7 +368,7 @@ static struct mqtt_status_register  mqtt_status_reads[] =
 // These timers are used in the main loop.
 #define HEARTBEAT_INTERVAL 9000
 #define RUNSTATE_INTERVAL 5000
-#define SEND_INTERVAL 10000
+#define SEND_INTERVAL 1000
 #define BATTERYSAVE_INTERVAL 3000
 #define PEAKSHAVING_INTERVAL 3000
 #define SELFUSE_INTERVAL 3000
@@ -1628,6 +1628,7 @@ int sendPassiveCmdV2(uint8_t id, uint16_t cmd, int32_t param, String requestCmd)
   return err;
 }
 
+/*
 void sendMqtt(char* topic, String msg_str)
 {
   char  msg[2000];
@@ -1636,6 +1637,28 @@ void sendMqtt(char* topic, String msg_str)
   msg_str.toCharArray(msg, msg_str.length() + 1); //packaging up the data to publish to mqtt
   if (!(mqtt.publish(topic, msg)))
     printScreen("MQTT publish failed");
+}
+*/
+void sendMqtt(char* topic, String msg_str)
+{
+    mqtt.setBufferSize(1024); // Ensure MQTT buffer size is sufficient
+    
+    // Ensure dynamic buffer allocation to avoid overflow
+    size_t msg_len = msg_str.length();
+    if (msg_len >= 1000) {
+        Serial.print("Message too long to send via MQTT");
+        return; // Prevent overflow
+    }
+    
+    char* msg = new char[msg_len + 1]; // Allocate dynamic buffer
+    msg_str.toCharArray(msg, msg_len + 1); // Convert String to C-string
+    
+    // Attempt to publish the message
+    if (!mqtt.publish(topic, msg)) {
+        Serial.print("MQTT publish failed");
+    }
+    
+    delete[] msg; // Free allocated memory
 }
 
 int sendPassiveCmd(uint8_t id, uint16_t cmd, uint16_t param, String pubTopic)
@@ -2231,6 +2254,7 @@ void setup()
     pinMode(SERIAL_COMMUNICATION_CONTROL_PIN, OUTPUT);
     digitalWrite(SERIAL_COMMUNICATION_CONTROL_PIN, RS485_RX);
     RS485Serial.begin(9600);
+    Serial.begin(115200);
   }
   delay(500);
   drd->stop();
